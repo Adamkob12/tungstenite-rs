@@ -21,8 +21,15 @@ use bytes::BytesMut;
 use log::*;
 use std::io::{self, Cursor, Error as IoError, ErrorKind as IoErrorKind, Read, Write};
 
-/// Read buffer size used for `FrameSocket`.
-const READ_BUF_LEN: usize = 128 * 1024;
+/// Read buffer size for `FrameSocket`.
+///
+/// Incoming client messages in this application are well under 1 KiB.
+/// 4 KiB is large enough to read a full frame in a single syscall.
+///
+/// This buffer is allocated once per connection and reused across frames —
+/// data is copied from it into `in_buffer` via `extend_from_slice`, which
+/// uses `reserve` + `ptr::copy_nonoverlapping` with no zero-initialisation.
+const READ_BUF_LEN: usize = 4 * 1024;
 
 /// A reader and writer for WebSocket frames.
 #[derive(Debug)]
@@ -102,9 +109,11 @@ where
 /// A codec for WebSocket frames.
 #[derive(Debug)]
 pub(super) struct FrameCodec {
-    /// Buffer to read data from the stream.
+    /// Accumulated incoming bytes waiting to be parsed into a frame.
     in_buffer: BytesMut,
-    in_buf_max_read: usize,
+    /// Scratch buffer: data is read from the stream into this slice, then
+    /// appended to `in_buffer` via `extend_from_slice` (no zeroing).
+    read_buf: Box<[u8]>,
     /// Buffer to send packets to the network.
     out_buffer: Vec<u8>,
     /// Capacity limit for `out_buffer`.
@@ -122,9 +131,10 @@ pub(super) struct FrameCodec {
 impl FrameCodec {
     /// Create a new frame codec.
     pub(super) fn new(in_buf_len: usize) -> Self {
+        let read_buf_len = in_buf_len.max(FrameHeader::MAX_SIZE);
         Self {
-            in_buffer: BytesMut::with_capacity(in_buf_len),
-            in_buf_max_read: in_buf_len.max(FrameHeader::MAX_SIZE),
+            in_buffer: BytesMut::new(),
+            read_buf: vec![0u8; read_buf_len].into_boxed_slice(),
             out_buffer: <_>::default(),
             max_out_buffer_len: usize::MAX,
             out_buffer_write_len: 0,
@@ -134,11 +144,10 @@ impl FrameCodec {
 
     /// Create a new frame codec from partially read data.
     pub(super) fn from_partially_read(part: Vec<u8>, min_in_buf_len: usize) -> Self {
-        let mut in_buffer = BytesMut::from_iter(part);
-        in_buffer.reserve(min_in_buf_len.saturating_sub(in_buffer.len()));
+        let read_buf_len = min_in_buf_len.max(FrameHeader::MAX_SIZE);
         Self {
-            in_buffer,
-            in_buf_max_read: min_in_buf_len.max(FrameHeader::MAX_SIZE),
+            in_buffer: BytesMut::from_iter(part),
+            read_buf: vec![0u8; read_buf_len].into_boxed_slice(),
             out_buffer: <_>::default(),
             max_out_buffer_len: usize::MAX,
             out_buffer_write_len: 0,
@@ -229,14 +238,17 @@ impl FrameCodec {
         Ok(Some(frame))
     }
 
-    /// Read into available `in_buffer` capacity.
+    /// Read from the stream into `in_buffer` without zero-initialising.
+    ///
+    /// Data is first read into the reusable `read_buf` scratch slice, then
+    /// appended to `in_buffer` via `extend_from_slice`.  `extend_from_slice`
+    /// calls `reserve` + `ptr::copy_nonoverlapping` — no memset required.
     fn read_in(&mut self, stream: &mut impl Read) -> io::Result<usize> {
-        let len = self.in_buffer.len();
-        debug_assert!(self.in_buffer.capacity() > len);
-        self.in_buffer.resize(self.in_buffer.capacity().min(len + self.in_buf_max_read), 0);
-        let size = stream.read(&mut self.in_buffer[len..]);
-        self.in_buffer.truncate(len + size.as_ref().copied().unwrap_or(0));
-        size
+        let n = stream.read(&mut self.read_buf)?;
+        if n > 0 {
+            self.in_buffer.extend_from_slice(&self.read_buf[..n]);
+        }
+        Ok(n)
     }
 
     /// Writes a frame into the `out_buffer`.
